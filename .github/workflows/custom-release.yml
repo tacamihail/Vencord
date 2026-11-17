@@ -1,18 +1,110 @@
 name: Build custom Vencord release
 
 on:
+    # Manual releases: push a tag such as custom-v1.15.18-1
     push:
         tags:
             - "custom-*"
+    # Automatic releases: keep the custom branch in sync with upstream and
+    # publish a new release whenever upstream main moves.
+    schedule:
+        - cron: "23 */4 * * *"
+    workflow_dispatch:
+        inputs:
+            force:
+                description: "Build a release even if already up to date with upstream"
+                type: boolean
+                default: true
 
 permissions:
-    contents: read
+    contents: write
+
+# Never run two sync/release jobs at the same time.
+concurrency:
+    group: custom-release
+    cancel-in-progress: false
+
+env:
+    FORCE_COLOR: true
+    CUSTOM_BRANCH: custom-build-updated
+    UPSTREAM_REPO: Vendicated/Vencord
 
 jobs:
+    prepare:
+        runs-on: ubuntu-latest
+        outputs:
+            tag: ${{ steps.resolve.outputs.tag }}
+            should_build: ${{ steps.resolve.outputs.should_build }}
+        steps:
+            - uses: actions/checkout@v7
+              with:
+                  ref: ${{ env.CUSTOM_BRANCH }}
+                  fetch-depth: 0
+
+            - name: Configure git
+              run: |
+                  git config user.name "github-actions[bot]"
+                  git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+            - name: Resolve release tag
+              id: resolve
+              env:
+                  EVENT: ${{ github.event_name }}
+                  PUSHED_TAG: ${{ github.ref_name }}
+                  FORCE: ${{ inputs.force }}
+              run: |
+                  set -euo pipefail
+
+                  # Tag push: build exactly what was pushed.
+                  if [ "$EVENT" = "push" ]; then
+                      echo "tag=$PUSHED_TAG" >> "$GITHUB_OUTPUT"
+                      echo "should_build=true" >> "$GITHUB_OUTPUT"
+                      exit 0
+                  fi
+
+                  # Scheduled/manual run: merge upstream main into the custom branch.
+                  git remote add upstream "https://github.com/$UPSTREAM_REPO.git"
+                  git fetch --no-tags upstream main
+                  UPSTREAM_SHA=$(git rev-parse upstream/main)
+
+                  if git merge-base --is-ancestor "$UPSTREAM_SHA" HEAD; then
+                      if [ "$FORCE" != "true" ]; then
+                          echo "Already up to date with upstream ($UPSTREAM_SHA); nothing to do."
+                          echo "should_build=false" >> "$GITHUB_OUTPUT"
+                          exit 0
+                      fi
+                      echo "Already up to date with upstream ($UPSTREAM_SHA); rebuilding on request."
+                  else
+                      echo "Merging upstream $UPSTREAM_SHA into $CUSTOM_BRANCH"
+                      if ! git merge --no-edit "$UPSTREAM_SHA"; then
+                          git merge --abort || true
+                          echo "::error::Merge conflict with upstream. Resolve it manually on $CUSTOM_BRANCH, then re-run this workflow."
+                          exit 1
+                      fi
+                      git push origin "HEAD:$CUSTOM_BRANCH"
+                  fi
+
+                  # Tag name: custom-v<upstream version>-<rebuild number>, e.g. custom-v1.15.18-1
+                  VERSION=$(git show "$UPSTREAM_SHA:package.json" | jq -r .version)
+                  git fetch --tags --force origin
+                  BASE="custom-v${VERSION}"
+                  LAST=$(git tag -l "${BASE}-*" | sed "s/^${BASE}-//" | sort -n | tail -n1)
+                  NEXT=$(( ${LAST:-0} + 1 ))
+                  TAG="${BASE}-${NEXT}"
+
+                  git tag "$TAG" HEAD
+                  git push origin "refs/tags/$TAG"
+                  echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+                  echo "should_build=true" >> "$GITHUB_OUTPUT"
+
     build-vencord:
+        needs: prepare
+        if: needs.prepare.outputs.should_build == 'true'
         runs-on: ubuntu-latest
         steps:
             - uses: actions/checkout@v7
+              with:
+                  ref: ${{ needs.prepare.outputs.tag }}
             - uses: pnpm/action-setup@v6
 
             - name: Use Node.js 24
@@ -26,7 +118,7 @@ jobs:
 
             - name: Resolve build hash
               id: hash
-              run: echo "value=$(git rev-parse --short=7 "$GITHUB_SHA")" >> "$GITHUB_OUTPUT"
+              run: echo "value=$(git rev-parse --short=7 HEAD)" >> "$GITHUB_OUTPUT"
 
             - name: Build Vencord
               env:
@@ -45,12 +137,15 @@ jobs:
                       dist/renderer.css
 
     build-installer:
+        needs: prepare
+        if: needs.prepare.outputs.should_build == 'true'
         runs-on: windows-latest
         permissions:
             contents: write
         steps:
             - uses: actions/checkout@v7
               with:
+                  ref: ${{ needs.prepare.outputs.tag }}
                   path: vencord
 
             - uses: actions/checkout@v7
@@ -92,12 +187,14 @@ jobs:
 
             - name: Build GUI installer
               shell: msys2 {0}
+              env:
+                  TAG: ${{ needs.prepare.outputs.tag }}
               run: |
                   cd installer
                   export GOROOT=/mingw64/lib/go
                   export GOPATH=/mingw64
                   export PATH="/mingw64/bin:$PATH"
-                  make GUI=1 VERSION="${GITHUB_REF_NAME}"
+                  make GUI=1 VERSION="${TAG}"
 
             - name: Upload installer
               uses: actions/upload-artifact@v4
@@ -109,7 +206,7 @@ jobs:
             - name: Attach installer to release
               env:
                   GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-                  TAG: ${{ github.ref_name }}
+                  TAG: ${{ needs.prepare.outputs.tag }}
                   REPO: ${{ github.repository }}
               shell: bash
               run: |
@@ -122,15 +219,19 @@ jobs:
     publish:
         runs-on: ubuntu-latest
         needs:
+            - prepare
             - build-vencord
+        if: needs.prepare.outputs.should_build == 'true'
         permissions:
             contents: write
         steps:
             - uses: actions/checkout@v7
+              with:
+                  ref: ${{ needs.prepare.outputs.tag }}
 
             - name: Resolve build hash
               id: hash
-              run: echo "value=$(git rev-parse --short=7 "$GITHUB_SHA")" >> "$GITHUB_OUTPUT"
+              run: echo "value=$(git rev-parse --short=7 HEAD)" >> "$GITHUB_OUTPUT"
 
             - uses: actions/download-artifact@v4
               with:
@@ -146,7 +247,7 @@ jobs:
             - name: Publish GitHub Release
               env:
                   GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-                  TAG: ${{ github.ref_name }}
+                  TAG: ${{ needs.prepare.outputs.tag }}
                   REPO: ${{ github.repository }}
                   HASH: ${{ steps.hash.outputs.value }}
               run: |
